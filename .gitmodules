@@ -1,0 +1,3 @@
+[submodule "PluginSDK"]
+	path = PluginSDK
+	url = https://github.com/D2RLoader/PluginSDK
