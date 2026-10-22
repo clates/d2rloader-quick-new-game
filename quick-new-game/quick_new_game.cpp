@@ -2,14 +2,20 @@
 // at the difficulty you last picked yourself.
 //
 // It only sends the UI messages the game's own buttons send:
-//   PausePanelMessage:ExitGame          (pause menu "Save and Exit")
-//   CharacterSelect:LoadCharacter:<d>   (difficulty popup; replayed exactly as last seen)
+//   PanelManager:OpenPanel:PauseLayout   (open the pause menu; ExitGame is ignored while it's closed)
+//   PausePanelMessage:ExitGame           (pause menu "Save and Exit")
+//   CharacterSelect:LoadCharacter:<d>    (difficulty popup; replayed exactly as last clicked)
 // No memory writes, no item or patch services. Offline single player only.
+//
+// Messages sent to a panel that isn't open are ignored, so the plugin simply
+// resends on a short timer until the next lifecycle event confirms the step.
+// All state lives on the UI thread.
 
 #include <D2RLPlugin/api.h>
 
 #include <windows.h>
 
+#include <cstdint>
 #include <cstdio>
 #include <cstring>
 
@@ -18,53 +24,48 @@ static constexpr D2RL::PluginInfo Info {
 	.abiVersion  = D2RL_PLUGIN_ABI_VERSION,
 	.id          = "quick-new-game",
 	.name        = "Quick New Game",
-	.version     = "0.4.0",
+	.version     = "0.5.0",
 	.author      = "Lates",
 	.description = "Save & exit, then rejoin the same character at the same difficulty.",
 	.flags       = D2RL::PluginFlags::Client,
 };
 
-static constexpr ULONGLONG ExitWaitMs  = 10000;  // disarm if the game hasn't been left this long after the press
-static constexpr ULONGLONG MenuOpenMs  = 400;    // after opening the pause menu, wait this long before Exit
-static constexpr ULONGLONG ExitRetryMs = 1500;   // then resend Exit this often until the game is left
-static constexpr ULONGLONG FirstTryMs  = 2000;   // after leaving, wait this long before the first rejoin attempt
-static constexpr ULONGLONG RetryMs     = 3000;   // then retry this often until the game is joined
-static constexpr ULONGLONG TimeoutMs   = 30000;  // give up this long after leaving
+static constexpr ULONGLONG ExitFirstMs  = 100;    // after opening the pause menu, first Save and Exit
+static constexpr ULONGLONG ExitRetryMs  = 250;    // resend Save and Exit until GameLeft
+static constexpr ULONGLONG ExitGiveUpMs = 5000;   // still in game this long after the press: stop
+static constexpr ULONGLONG LoadFirstMs  = 500;    // after GameLeft, first rejoin
+static constexpr ULONGLONG LoadRetryMs  = 500;    // resend the rejoin until GameJoined
+static constexpr ULONGLONG LoadGiveUpMs = 30000;  // not back in game this long after leaving: stop
 
-static const D2RL::PluginContext*  g_ctx;
-static const D2RL::WidgetService*  g_widgets;
-static const D2RL::ThreadService*  g_threads;
-
-// UI messages are learned from your own clicks, so replays match the game exactly.
-// Until a click is seen, use the layout's "Target:Command:Arg" shape (Hell for the rejoin).
 struct Message {
 	char target[64];
 	char command[64];
 	char text[64];
-	bool learned;
 };
-// The pause panel only handles ExitGame while it's open, so open it first.
-static constexpr Message OpenPause { "PanelManager", "OpenPanel", "PauseLayout", true };
-static Message g_exit { "PausePanelMessage", "ExitGame", "", false };
-static Message g_load { "CharacterSelect", "LoadCharacter", "2", false };
+
+static constexpr Message OpenPause { "PanelManager", "OpenPanel", "PauseLayout" };
+static constexpr Message SaveExit  { "PausePanelMessage", "ExitGame", "" };
+static Message           g_load    { "CharacterSelect", "LoadCharacter", "2" };  // Hell until you pick one
+static bool              g_loadLearned;
+
+enum class Phase { Idle, Exiting, Rejoining };
+
+static const D2RL::PluginContext* g_ctx;
+static const D2RL::WidgetService* g_widgets;
+static const D2RL::ThreadService* g_threads;
 
 static bool      g_inGame;
-static bool      g_armed;       // set by the keybind, cleared once we rejoin or give up
-static ULONGLONG g_armedAt;     // when the keybind was pressed
-static ULONGLONG g_leftAt;      // when the game was left (0 = not yet)
-static ULONGLONG g_nextTryAt;
-static bool      g_logUi;
+static bool      g_verbose;     // newgame-ui: log UI messages and every send
+static Phase     g_phase = Phase::Idle;
+static uint32_t  g_run;         // bumped per press, so a stale tick chain stops itself
+static ULONGLONG g_pressedAt, g_leftAt, g_nextSendAt;
 
 static void Say(const char* text) noexcept {
 	g_ctx->WriteConsoleMessage(text);
 	g_ctx->LogInfo(text);
 }
 
-static void Copy(char* dst, size_t size, const char* src) noexcept {
-	std::snprintf(dst, size, "%s", src ? src : "");
-}
-
-static void Dispatch(const char* target, const char* command, const char* text) noexcept {
+static void Send(const char* target, const char* command, const char* text) noexcept {
 	const D2RL::Widgets::UiAction action {
 		.structSize = D2RL::Widgets::UiActionSize,
 		.target     = target,
@@ -72,62 +73,61 @@ static void Dispatch(const char* target, const char* command, const char* text) 
 		.text       = (text && *text) ? text : nullptr,
 	};
 	const auto result = g_widgets->dispatchUiAction(g_ctx, &action);
-	char line[256];
-	std::snprintf(line, sizeof line, "quick-new-game: sent %s:%s%s%s (result %u)", target, command,
-		action.text ? ":" : "", action.text ? action.text : "", static_cast<unsigned>(result));
-	Say(line);
+	if (g_verbose || result != D2RL::Widgets::Result::Success) {
+		char line[256];
+		std::snprintf(line, sizeof line, "quick-new-game: sent %s:%s%s%s (result %u)", target, command,
+			action.text ? ":" : "", action.text ? action.text : "", static_cast<unsigned>(result));
+		Say(line);
+	}
 }
 
 static void Send(const Message& m) noexcept {
-	Dispatch(m.target, m.command, m.text);
+	Send(m.target, m.command, m.text);
 }
 
-// Runs on the UI thread and re-queues itself every frame until the plan is done.
-// No widget lookups: it sends messages on a timer and watches the lifecycle
-// events. Before leaving: Exit until GameLeft. After: rejoin until GameJoined.
-static void __cdecl Tick(const D2RL::PluginContext*, void*) noexcept {
-	if (!g_armed) {
+static void Stop(const char* why) noexcept {
+	g_phase = Phase::Idle;
+	if (why != nullptr) {
+		Say(why);
+	}
+}
+
+// One step per UI update while a run is active, re-queued until the run ends.
+static void __cdecl Tick(const D2RL::PluginContext*, void* userData) noexcept {
+	if (g_phase == Phase::Idle || static_cast<uint32_t>(reinterpret_cast<uintptr_t>(userData)) != g_run) {
 		return;
 	}
 	const ULONGLONG now = GetTickCount64();
-	if (g_leftAt == 0) {
-		if (now - g_armedAt > ExitWaitMs) {
-			g_armed = false;
-			Say("quick-new-game: the game didn't exit, so nothing more will happen.");
-			return;
-		}
-		if (now >= g_nextTryAt) {
-			Send(g_exit);
-			g_nextTryAt = now + ExitRetryMs;
-		}
-	} else if (now - g_leftAt > TimeoutMs) {
-		g_armed = false;
-		Say("quick-new-game: gave up rejoining. Try newgame-ui and click your difficulty once so I can learn its message.");
-		return;
-	} else if (now >= g_nextTryAt) {
-		Send(g_load);
-		g_nextTryAt = now + RetryMs;
+	if (g_phase == Phase::Exiting && now - g_pressedAt > ExitGiveUpMs) {
+		return Stop("quick-new-game: the game didn't exit; stopped.");
 	}
-	g_threads->runOnUiThread(g_ctx, Tick, nullptr);
+	if (g_phase == Phase::Rejoining && now - g_leftAt > LoadGiveUpMs) {
+		return Stop("quick-new-game: couldn't rejoin; stopped. Pick your character and difficulty by hand.");
+	}
+	if (now >= g_nextSendAt) {
+		const bool exiting = g_phase == Phase::Exiting;
+		Send(exiting ? SaveExit : g_load);
+		g_nextSendAt = now + (exiting ? ExitRetryMs : LoadRetryMs);
+	}
+	g_threads->runOnUiThread(g_ctx, Tick, userData);
 }
 
-static void __cdecl ExitGame(const D2RL::PluginContext*, void*) noexcept {
+static void __cdecl Begin(const D2RL::PluginContext*, void*) noexcept {
+	if (!g_inGame || g_phase != Phase::Idle) {
+		return;
+	}
+	g_phase      = Phase::Exiting;
+	g_pressedAt  = GetTickCount64();
+	g_nextSendAt = g_pressedAt + ExitFirstMs;
 	Send(OpenPause);
-	g_nextTryAt = GetTickCount64() + MenuOpenMs;
-	g_threads->runOnUiThread(g_ctx, Tick, nullptr);
+	g_threads->runOnUiThread(g_ctx, Tick, reinterpret_cast<void*>(static_cast<uintptr_t>(++g_run)));
 }
 
 static auto __cdecl OnNewGame(const D2RL::PluginContext*, const D2RL::Input::ActionEvent* event, void*) noexcept -> D2RL::Input::ActionResult {
 	if (!D2RL::Input::HasActionEventField(event, D2RL::Input::ActionEventRequiredSize) || event->kind != D2RL::Input::ActionEventKind::Pressed) {
 		return D2RL::Input::ActionResult::Ignored;
 	}
-	if (!g_inGame || g_armed) {
-		return D2RL::Input::ActionResult::Ignored;
-	}
-	g_armed   = true;
-	g_armedAt = GetTickCount64();
-	g_leftAt  = 0;
-	g_threads->runOnUiThread(g_ctx, ExitGame, nullptr);
+	g_threads->runOnUiThread(g_ctx, Begin, nullptr);   // all state changes happen on the UI thread
 	return D2RL::Input::ActionResult::Handled;
 }
 
@@ -135,78 +135,74 @@ static void __cdecl OnGameplay(const D2RL::PluginContext*, const D2RL::Lifecycle
 	if (event == nullptr) {
 		return;
 	}
-	if (event->kind == D2RL::Lifecycle::GameplayEventKind::GameJoined) {
-		g_inGame = true;
-		g_armed  = false;
-	} else if (event->kind == D2RL::Lifecycle::GameplayEventKind::GameLeft) {
+	const ULONGLONG now = GetTickCount64();
+	if (event->kind == D2RL::Lifecycle::GameplayEventKind::GameLeft) {
 		g_inGame = false;
-		if (g_armed) {
-			g_leftAt    = GetTickCount64();
-			g_nextTryAt = g_leftAt + FirstTryMs;
+		if (g_phase == Phase::Exiting) {
+			g_phase      = Phase::Rejoining;
+			g_leftAt     = now;
+			g_nextSendAt = now + LoadFirstMs;
+		}
+	} else if (event->kind == D2RL::Lifecycle::GameplayEventKind::GameJoined) {
+		g_inGame = true;
+		if (g_phase == Phase::Rejoining) {
+			char line[128];
+			std::snprintf(line, sizeof line, "quick-new-game: back in game in %.1f s (exit %.1f s, rejoin %.1f s).",
+				(now - g_pressedAt) / 1000.0, (g_leftAt - g_pressedAt) / 1000.0, (now - g_leftAt) / 1000.0);
+			Stop(line);
+		} else {
+			g_phase = Phase::Idle;
 		}
 	}
-}
-
-static void Learn(Message& m, const D2RL::SharedEvents::UiMessageEvent* event) noexcept {
-	Copy(m.target, sizeof m.target, event->target);
-	Copy(m.command, sizeof m.command, event->command);
-	Copy(m.text, sizeof m.text, event->text);
-	m.learned = true;
-}
-
-static void Describe(char* line, size_t size, const char* what, const Message& m) noexcept {
-	std::snprintf(line, size, "  %s: %s:%s%s%s (%s)", what, m.target, m.command, *m.text ? ":" : "", m.text,
-		m.learned ? "learned from your click" : "default guess");
 }
 
 static auto __cdecl OnUiMessage(const D2RL::PluginContext*, const D2RL::SharedEvents::UiMessageEvent* event, void*) noexcept -> D2RL::SharedEvents::UiMessageAction {
 	if (event == nullptr || event->structSize < D2RL::SharedEvents::UiMessageEventRequiredSize || event->target == nullptr || event->command == nullptr) {
 		return D2RL::SharedEvents::UiMessageAction::Continue;
 	}
-	if (g_logUi && std::strcmp(event->target, "InputMessage") != 0) {   // skip mouse-move spam
+	if (g_verbose && std::strcmp(event->target, "InputMessage") != 0) {   // skip mouse-move spam
 		char line[512];
 		std::snprintf(line, sizeof line, "ui: target=\"%s\" command=\"%s\" text=\"%s\"", event->target, event->command, event->text ? event->text : "");
 		Say(line);
 	}
-	// Remember the exact messages from real clicks, so the replays match them.
-	// Skip while armed, so the plugin's own sends don't count as clicks.
-	if (!g_armed) {
-		if (std::strcmp(event->target, "CharacterSelect") == 0 && std::strncmp(event->command, "LoadCharacter", 13) == 0) {
-			Learn(g_load, event);
-		} else if (std::strstr(event->target, "Pause") != nullptr && std::strstr(event->command, "Exit") != nullptr) {
-			Learn(g_exit, event);
-		}
+	// Remember the difficulty you click, so the rejoin replays it exactly.
+	// Ignore our own rejoin sends.
+	if (g_phase == Phase::Idle && std::strcmp(event->target, "CharacterSelect") == 0 && std::strncmp(event->command, "LoadCharacter", 13) == 0) {
+		std::snprintf(g_load.target, sizeof g_load.target, "%s", event->target);
+		std::snprintf(g_load.command, sizeof g_load.command, "%s", event->command);
+		std::snprintf(g_load.text, sizeof g_load.text, "%s", event->text ? event->text : "");
+		g_loadLearned = true;
 	}
 	return D2RL::SharedEvents::UiMessageAction::Continue;
 }
 
 static auto __cdecl UiLogCommand(D2R::Game::Client*, const D2RL::ConsoleCommandContext* command, void*) noexcept -> D2RL::ConsoleCommandResult {
-	g_logUi = !g_logUi;
+	g_verbose = !g_verbose;
 	char line[256];
-	std::snprintf(line, sizeof line, "quick-new-game: UI message log %s.", g_logUi ? "on" : "off");
-	command->plugin->WriteConsoleMessage(line);
-	Describe(line, sizeof line, "exit", g_exit);
-	command->plugin->WriteConsoleMessage(line);
-	Describe(line, sizeof line, "rejoin", g_load);
+	std::snprintf(line, sizeof line, "quick-new-game: UI log %s. Rejoin sends %s:%s%s%s (%s).", g_verbose ? "on" : "off",
+		g_load.target, g_load.command, *g_load.text ? ":" : "", g_load.text, g_loadLearned ? "your last pick" : "default Hell");
 	command->plugin->WriteConsoleMessage(line);
 	return D2RL::ConsoleCommandResult::Handled;
 }
 
-// newgame-send Target:Command[:Text]  - send any UI message, for finding the right one.
+// newgame-send Target:Command[:Text]  - send any UI message, for experimenting.
 static auto __cdecl SendCommand(D2R::Game::Client*, const D2RL::ConsoleCommandContext* command, void*) noexcept -> D2RL::ConsoleCommandResult {
 	char buf[256];
-	Copy(buf, sizeof buf, command->args);
-	char* command_ = std::strchr(buf, ':');
-	if (command_ == nullptr) {
+	std::snprintf(buf, sizeof buf, "%s", command->args ? command->args : "");
+	char* cmd = std::strchr(buf, ':');
+	if (cmd == nullptr) {
 		command->plugin->WriteConsoleMessage("usage: newgame-send Target:Command[:Text]");
 		return D2RL::ConsoleCommandResult::Failed;
 	}
-	*command_++ = 0;
-	char* text = std::strchr(command_, ':');
+	*cmd++ = 0;
+	char* text = std::strchr(cmd, ':');
 	if (text != nullptr) {
 		*text++ = 0;
 	}
-	Dispatch(buf, command_, text);
+	const bool verbose = g_verbose;
+	g_verbose = true;   // always report the result of a manual send
+	Send(buf, cmd, text);
+	g_verbose = verbose;
 	return D2RL::ConsoleCommandResult::Handled;
 }
 
@@ -272,7 +268,7 @@ D2RL_PLUGIN_EXPORT auto D2RLoaderLoadPlugin(const D2RL::PluginContext* context) 
 		return false;
 	}
 
-	return context->RegisterConsoleCommand("newgame-ui", UiLogCommand, "Toggle logging of UI messages and show the rejoin difficulty.")
+	return context->RegisterConsoleCommand("newgame-ui", UiLogCommand, "Toggle the UI message log and show what the rejoin sends.")
 		&& context->RegisterConsoleCommand("newgame-send", SendCommand, "Send a UI message: newgame-send Target:Command[:Text]");
 }
 
