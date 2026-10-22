@@ -7,8 +7,10 @@
 //   CharacterSelect:LoadCharacter:<d>    (difficulty popup; replayed exactly as last clicked)
 // No memory writes, no item or patch services. Offline single player only.
 //
-// Messages sent to a panel that isn't open are ignored, so the plugin simply
-// resends on a short timer until the next lifecycle event confirms the step.
+// Open and Save and Exit go out in the same UI update, so the pause menu never
+// draws. The rejoin fires as soon as the character screen sends
+// CharacterSelect:SelectAct (its list is loaded). Timed resends back up both
+// steps; messages to a panel that isn't open are ignored, so they're harmless.
 // All state lives on the UI thread.
 
 #include <D2RLPlugin/api.h>
@@ -24,16 +26,15 @@ static constexpr D2RL::PluginInfo Info {
 	.abiVersion  = D2RL_PLUGIN_ABI_VERSION,
 	.id          = "quick-new-game",
 	.name        = "Quick New Game",
-	.version     = "0.5.0",
+	.version     = "0.6.0",
 	.author      = "Lates",
 	.description = "Save & exit, then rejoin the same character at the same difficulty.",
 	.flags       = D2RL::PluginFlags::Client,
 };
 
-static constexpr ULONGLONG ExitFirstMs  = 100;    // after opening the pause menu, first Save and Exit
 static constexpr ULONGLONG ExitRetryMs  = 250;    // resend Save and Exit until GameLeft
 static constexpr ULONGLONG ExitGiveUpMs = 5000;   // still in game this long after the press: stop
-static constexpr ULONGLONG LoadFirstMs  = 500;    // after GameLeft, first rejoin
+static constexpr ULONGLONG LoadFirstMs  = 1500;   // fallback if the screen-ready message never comes
 static constexpr ULONGLONG LoadRetryMs  = 500;    // resend the rejoin until GameJoined
 static constexpr ULONGLONG LoadGiveUpMs = 30000;  // not back in game this long after leaving: stop
 
@@ -58,7 +59,7 @@ static bool      g_inGame;
 static bool      g_verbose;     // newgame-ui: log UI messages and every send
 static Phase     g_phase = Phase::Idle;
 static uint32_t  g_run;         // bumped per press, so a stale tick chain stops itself
-static ULONGLONG g_pressedAt, g_leftAt, g_nextSendAt;
+static ULONGLONG g_pressedAt, g_leftAt, g_readyAt, g_nextSendAt;
 
 static void Say(const char* text) noexcept {
 	g_ctx->WriteConsoleMessage(text);
@@ -118,8 +119,10 @@ static void __cdecl Begin(const D2RL::PluginContext*, void*) noexcept {
 	}
 	g_phase      = Phase::Exiting;
 	g_pressedAt  = GetTickCount64();
-	g_nextSendAt = g_pressedAt + ExitFirstMs;
+	g_readyAt    = 0;
+	g_nextSendAt = g_pressedAt + ExitRetryMs;
 	Send(OpenPause);
+	Send(SaveExit);   // same update: handled before the menu ever draws
 	g_threads->runOnUiThread(g_ctx, Tick, reinterpret_cast<void*>(static_cast<uintptr_t>(++g_run)));
 }
 
@@ -146,9 +149,13 @@ static void __cdecl OnGameplay(const D2RL::PluginContext*, const D2RL::Lifecycle
 	} else if (event->kind == D2RL::Lifecycle::GameplayEventKind::GameJoined) {
 		g_inGame = true;
 		if (g_phase == Phase::Rejoining) {
-			char line[128];
-			std::snprintf(line, sizeof line, "quick-new-game: back in game in %.1f s (exit %.1f s, rejoin %.1f s).",
-				(now - g_pressedAt) / 1000.0, (g_leftAt - g_pressedAt) / 1000.0, (now - g_leftAt) / 1000.0);
+			char ready[48] = "screen-ready signal missed, used timer";
+			if (g_readyAt != 0) {
+				std::snprintf(ready, sizeof ready, "screen ready %.2f s", (g_readyAt - g_leftAt) / 1000.0);
+			}
+			char line[192];
+			std::snprintf(line, sizeof line, "quick-new-game: back in game in %.2f s (exit %.2f s, %s, rejoin %.2f s).",
+				(now - g_pressedAt) / 1000.0, (g_leftAt - g_pressedAt) / 1000.0, ready, (now - g_leftAt) / 1000.0);
 			Stop(line);
 		} else {
 			g_phase = Phase::Idle;
@@ -164,6 +171,13 @@ static auto __cdecl OnUiMessage(const D2RL::PluginContext*, const D2RL::SharedEv
 		char line[512];
 		std::snprintf(line, sizeof line, "ui: target=\"%s\" command=\"%s\" text=\"%s\"", event->target, event->command, event->text ? event->text : "");
 		Say(line);
+	}
+	// The character screen picks the selected character's act once its list is
+	// loaded: rejoin on the next update instead of waiting for the timer.
+	if (g_phase == Phase::Rejoining && g_readyAt == 0 && std::strcmp(event->target, "CharacterSelect") == 0
+		&& std::strcmp(event->command, "SelectAct") == 0) {
+		g_readyAt    = GetTickCount64();
+		g_nextSendAt = 0;
 	}
 	// Remember the difficulty you click, so the rejoin replays it exactly.
 	// Ignore our own rejoin sends.
