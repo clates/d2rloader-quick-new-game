@@ -7,8 +7,9 @@
 //   CharacterSelect:LoadCharacter:<d>    (difficulty popup; replayed exactly as last clicked)
 // No memory writes, no item or patch services. Offline single player only.
 //
-// Open and Save and Exit go out in the same UI update, so the pause menu never
-// draws. The rejoin fires as soon as the character screen sends
+// Save and Exit goes out on the UI update right after the pause menu opens (in
+// the same update it's ignored), so the menu shows for about a frame. The
+// rejoin fires as soon as the character screen sends
 // CharacterSelect:SelectAct (its list is loaded). Timed resends back up both
 // steps; messages to a panel that isn't open are ignored, so they're harmless.
 // All state lives on the UI thread.
@@ -26,13 +27,13 @@ static constexpr D2RL::PluginInfo Info {
 	.abiVersion  = D2RL_PLUGIN_ABI_VERSION,
 	.id          = "quick-new-game",
 	.name        = "Quick New Game",
-	.version     = "0.6.0",
+	.version     = "0.7.0",
 	.author      = "Lates",
 	.description = "Save & exit, then rejoin the same character at the same difficulty.",
 	.flags       = D2RL::PluginFlags::Client,
 };
 
-static constexpr ULONGLONG ExitRetryMs  = 250;    // resend Save and Exit until GameLeft
+static constexpr ULONGLONG ExitRetryMs  = 50;     // resend Save and Exit until GameLeft
 static constexpr ULONGLONG ExitGiveUpMs = 5000;   // still in game this long after the press: stop
 static constexpr ULONGLONG LoadFirstMs  = 1500;   // fallback if the screen-ready message never comes
 static constexpr ULONGLONG LoadRetryMs  = 500;    // resend the rejoin until GameJoined
@@ -120,9 +121,8 @@ static void __cdecl Begin(const D2RL::PluginContext*, void*) noexcept {
 	g_phase      = Phase::Exiting;
 	g_pressedAt  = GetTickCount64();
 	g_readyAt    = 0;
-	g_nextSendAt = g_pressedAt + ExitRetryMs;
+	g_nextSendAt = 0;   // Save and Exit on the very next update
 	Send(OpenPause);
-	Send(SaveExit);   // same update: handled before the menu ever draws
 	g_threads->runOnUiThread(g_ctx, Tick, reinterpret_cast<void*>(static_cast<uintptr_t>(++g_run)));
 }
 
