@@ -1,18 +1,30 @@
 // Quick New Game: one keybind to save & exit, then rejoin on the same character
-// at the difficulty you last picked yourself.
+// at the difficulty of the game you just left.
 //
 // It only sends the UI messages the game's own buttons send:
 //   PanelManager:OpenPanel:PauseLayout   (open the pause menu; ExitGame is ignored while it's closed)
 //   PausePanelMessage:ExitGame           (pause menu "Save and Exit")
-//   CharacterSelect:LoadCharacter:<d>    (difficulty popup; replayed exactly as last clicked)
+//   CharacterSelect:LoadCharacter:<d>    (difficulty popup)
+//   MainMenuHD:Play                      (Play button: fallback, see below)
+//
+// The difficulty comes from the LoadCharacter message that started the current
+// game. A game started without one (Play on a character that hasn't beaten
+// Normal, so there's no popup, or a new character) is Normal. If the rejoin
+// still hasn't joined after a couple of tries it also presses Play, which
+// starts a Normal-only character directly and opens the popup otherwise.
+//
 // No memory writes, no item or patch services. Offline single player only.
 //
 // Save and Exit goes out on the UI update right after the pause menu opens (in
-// the same update it's ignored), so the menu shows for about a frame. The
-// rejoin fires as soon as the character screen sends
-// CharacterSelect:SelectAct (its list is loaded). Timed resends back up both
-// steps; messages to a panel that isn't open are ignored, so they're harmless.
-// All state lives on the UI thread.
+// the same update it's ignored), so the menu shows for about a frame, and stops
+// once the game heads to the menus (FrontEndNavigation:ToFrontEnd).
+//
+// The rejoin waits until the character screen has finished loading: it has
+// opened (OpenPanel CharacterSelectPanel or CharacterSelect:SelectTab) and the
+// loading panel is closed. CharacterSelect:SelectAct comes too early on heavily
+// modded setups, and a load sent then can leave the world black. Resends stop
+// as soon as the game starts loading (FrontEndNavigation:ToGame), so a slow
+// load never gets a second request. All state lives on the UI thread.
 
 #include <D2RLPlugin/api.h>
 
@@ -27,17 +39,19 @@ static constexpr D2RL::PluginInfo Info {
 	.abiVersion  = D2RL_PLUGIN_ABI_VERSION,
 	.id          = "quick-new-game",
 	.name        = "Quick New Game",
-	.version     = "0.7.0",
+	.version     = "0.8.0",
 	.author      = "Lates",
 	.description = "Save & exit, then rejoin the same character at the same difficulty.",
 	.flags       = D2RL::PluginFlags::Client,
 };
 
-static constexpr ULONGLONG ExitRetryMs  = 50;     // resend Save and Exit until GameLeft
+static constexpr ULONGLONG ExitRetryMs  = 250;    // resend Save and Exit until the game heads to the menus
 static constexpr ULONGLONG ExitGiveUpMs = 5000;   // still in game this long after the press: stop
-static constexpr ULONGLONG LoadFirstMs  = 1500;   // fallback if the screen-ready message never comes
-static constexpr ULONGLONG LoadRetryMs  = 500;    // resend the rejoin until GameJoined
+static constexpr ULONGLONG LoadFirstMs  = 8000;   // fallback if the screen-ready messages never come
+static constexpr ULONGLONG SettleMs     = 250;    // after the screen is ready, in case a loading panel follows
+static constexpr ULONGLONG LoadRetryMs  = 2000;   // resend the rejoin until the game starts loading
 static constexpr ULONGLONG LoadGiveUpMs = 30000;  // not back in game this long after leaving: stop
+static constexpr int       PlayAfterTries = 2;    // rejoin sends before the Play fallback joins in
 
 struct Message {
 	char target[64];
@@ -47,10 +61,11 @@ struct Message {
 
 static constexpr Message OpenPause { "PanelManager", "OpenPanel", "PauseLayout" };
 static constexpr Message SaveExit  { "PausePanelMessage", "ExitGame", "" };
-static Message           g_load    { "CharacterSelect", "LoadCharacter", "2" };  // Hell until you pick one
-static bool              g_loadLearned;
+static constexpr Message Play      { "MainMenuHD", "Play", "" };
+static Message           g_load    { "CharacterSelect", "LoadCharacter", "0" };  // the current game's difficulty
+static Message           g_seenLoad;   // the last LoadCharacter seen since leaving a game, if any
 
-enum class Phase { Idle, Exiting, Rejoining };
+enum class Phase { Idle, Exiting, Rejoining, Loading };   // Loading: the game accepted the rejoin
 
 static const D2RL::PluginContext* g_ctx;
 static const D2RL::WidgetService* g_widgets;
@@ -61,6 +76,10 @@ static bool      g_verbose;     // newgame-ui: log UI messages and every send
 static Phase     g_phase = Phase::Idle;
 static uint32_t  g_run;         // bumped per press, so a stale tick chain stops itself
 static ULONGLONG g_pressedAt, g_leftAt, g_readyAt, g_nextSendAt;
+static bool      g_exitAccepted;   // the game is heading to the menus: no more Save and Exit
+static bool      g_screenOpen;     // the character screen has opened since leaving
+static bool      g_screenLoading;  // the menu loading panel is up
+static int       g_loadSends;   // rejoin sends so far this run
 
 static void Say(const char* text) noexcept {
 	g_ctx->WriteConsoleMessage(text);
@@ -103,13 +122,28 @@ static void __cdecl Tick(const D2RL::PluginContext*, void* userData) noexcept {
 	if (g_phase == Phase::Exiting && now - g_pressedAt > ExitGiveUpMs) {
 		return Stop("quick-new-game: the game didn't exit; stopped.");
 	}
-	if (g_phase == Phase::Rejoining && now - g_leftAt > LoadGiveUpMs) {
+	if ((g_phase == Phase::Rejoining || g_phase == Phase::Loading) && now - g_leftAt > LoadGiveUpMs) {
 		return Stop("quick-new-game: couldn't rejoin; stopped. Pick your character and difficulty by hand.");
 	}
+	if (g_phase == Phase::Loading) {   // nothing to send; keep the give-up timer running
+		g_threads->runOnUiThread(g_ctx, Tick, userData);
+		return;
+	}
 	if (now >= g_nextSendAt) {
-		const bool exiting = g_phase == Phase::Exiting;
-		Send(exiting ? SaveExit : g_load);
-		g_nextSendAt = now + (exiting ? ExitRetryMs : LoadRetryMs);
+		if (g_phase == Phase::Exiting) {
+			if (!g_exitAccepted) {
+				Send(SaveExit);
+			}
+			g_nextSendAt = now + ExitRetryMs;
+		} else if (g_screenLoading) {
+			g_nextSendAt = now + SettleMs;   // never load while the menu is still loading
+		} else {
+			// Alternate LoadCharacter with Play once LoadCharacter alone hasn't worked.
+			const bool play = g_loadSends >= PlayAfterTries && (g_loadSends - PlayAfterTries) % 2 == 0;
+			Send(play ? Play : g_load);
+			++g_loadSends;
+			g_nextSendAt = now + LoadRetryMs;
+		}
 	}
 	g_threads->runOnUiThread(g_ctx, Tick, userData);
 }
@@ -121,6 +155,8 @@ static void __cdecl Begin(const D2RL::PluginContext*, void*) noexcept {
 	g_phase      = Phase::Exiting;
 	g_pressedAt  = GetTickCount64();
 	g_readyAt    = 0;
+	g_loadSends  = 0;
+	g_exitAccepted = g_screenOpen = g_screenLoading = false;
 	g_nextSendAt = 0;   // Save and Exit on the very next update
 	Send(OpenPause);
 	g_threads->runOnUiThread(g_ctx, Tick, reinterpret_cast<void*>(static_cast<uintptr_t>(++g_run)));
@@ -141,6 +177,7 @@ static void __cdecl OnGameplay(const D2RL::PluginContext*, const D2RL::Lifecycle
 	const ULONGLONG now = GetTickCount64();
 	if (event->kind == D2RL::Lifecycle::GameplayEventKind::GameLeft) {
 		g_inGame = false;
+		g_seenLoad.command[0] = 0;
 		if (g_phase == Phase::Exiting) {
 			g_phase      = Phase::Rejoining;
 			g_leftAt     = now;
@@ -148,14 +185,22 @@ static void __cdecl OnGameplay(const D2RL::PluginContext*, const D2RL::Lifecycle
 		}
 	} else if (event->kind == D2RL::Lifecycle::GameplayEventKind::GameJoined) {
 		g_inGame = true;
-		if (g_phase == Phase::Rejoining) {
+		// This game's difficulty: the popup's choice, or Normal when there was no popup.
+		g_load = g_seenLoad.command[0] ? g_seenLoad : Message { "CharacterSelect", "LoadCharacter", "0" };
+		if (g_verbose) {
+			char line[160];
+			std::snprintf(line, sizeof line, "quick-new-game: joined; rejoin will send %s:%s%s%s (event difficulty %u).", g_load.target,
+				g_load.command, *g_load.text ? ":" : "", g_load.text, event->difficulty);
+			Say(line);
+		}
+		if (g_phase == Phase::Rejoining || g_phase == Phase::Loading) {
 			char ready[48] = "screen-ready signal missed, used timer";
 			if (g_readyAt != 0) {
 				std::snprintf(ready, sizeof ready, "screen ready %.2f s", (g_readyAt - g_leftAt) / 1000.0);
 			}
 			char line[192];
-			std::snprintf(line, sizeof line, "quick-new-game: back in game in %.2f s (exit %.2f s, %s, rejoin %.2f s).",
-				(now - g_pressedAt) / 1000.0, (g_leftAt - g_pressedAt) / 1000.0, ready, (now - g_leftAt) / 1000.0);
+			std::snprintf(line, sizeof line, "quick-new-game: back in game in %.2f s (exit %.2f s, %s, rejoin %.2f s, %d rejoin send%s).",
+				(now - g_pressedAt) / 1000.0, (g_leftAt - g_pressedAt) / 1000.0, ready, (now - g_leftAt) / 1000.0, g_loadSends, g_loadSends == 1 ? "" : "s");
 			Stop(line);
 		} else {
 			g_phase = Phase::Idle;
@@ -172,20 +217,43 @@ static auto __cdecl OnUiMessage(const D2RL::PluginContext*, const D2RL::SharedEv
 		std::snprintf(line, sizeof line, "ui: target=\"%s\" command=\"%s\" text=\"%s\"", event->target, event->command, event->text ? event->text : "");
 		Say(line);
 	}
-	// The character screen picks the selected character's act once its list is
-	// loaded: rejoin on the next update instead of waiting for the timer.
-	if (g_phase == Phase::Rejoining && g_readyAt == 0 && std::strcmp(event->target, "CharacterSelect") == 0
-		&& std::strcmp(event->command, "SelectAct") == 0) {
-		g_readyAt    = GetTickCount64();
-		g_nextSendAt = 0;
+	const auto is = [event](const char* target, const char* command, const char* text = nullptr) {
+		return std::strcmp(event->target, target) == 0 && std::strcmp(event->command, command) == 0
+			&& (text == nullptr || (event->text != nullptr && std::strcmp(event->text, text) == 0));
+	};
+	const auto panel = [event](const char* command, const char* name) {   // any sender
+		return std::strcmp(event->command, command) == 0 && event->text != nullptr && std::strcmp(event->text, name) == 0;
+	};
+	if (g_phase == Phase::Exiting && is("FrontEndNavigation", "ToFrontEnd")) {
+		g_exitAccepted = true;
 	}
-	// Remember the difficulty you click, so the rejoin replays it exactly.
-	// Ignore our own rejoin sends.
-	if (g_phase == Phase::Idle && std::strcmp(event->target, "CharacterSelect") == 0 && std::strncmp(event->command, "LoadCharacter", 13) == 0) {
-		std::snprintf(g_load.target, sizeof g_load.target, "%s", event->target);
-		std::snprintf(g_load.command, sizeof g_load.command, "%s", event->command);
-		std::snprintf(g_load.text, sizeof g_load.text, "%s", event->text ? event->text : "");
-		g_loadLearned = true;
+	if (g_phase == Phase::Exiting || g_phase == Phase::Rejoining) {
+		if (panel("OpenPanel", "MainMenuLoadingPanel")) {
+			g_screenLoading = true;
+		} else if (panel("ClosePanel", "MainMenuLoadingPanel")) {
+			g_screenLoading = false;
+		} else if (panel("OpenPanel", "CharacterSelectPanel") || is("CharacterSelect", "SelectTab")) {
+			g_screenOpen = true;
+		}
+	}
+	// The character screen is open and done loading: rejoin shortly instead of
+	// waiting for the timer. Tick checks the loading panel again before sending.
+	if (g_phase == Phase::Rejoining && g_readyAt == 0 && g_screenOpen && !g_screenLoading) {
+		g_readyAt    = GetTickCount64();
+		g_nextSendAt = g_readyAt + SettleMs;
+	}
+	// The game took a rejoin request and is loading: stop sending.
+	if (g_phase == Phase::Rejoining && is("FrontEndNavigation", "ToGame")) {
+		g_phase = Phase::Loading;
+		if (g_verbose) {
+			Say("quick-new-game: game is loading; no more rejoin sends.");
+		}
+	}
+	// The difficulty this game starts in, yours or our own resend; kept at GameJoined.
+	if (std::strcmp(event->target, "CharacterSelect") == 0 && std::strncmp(event->command, "LoadCharacter", 13) == 0) {
+		std::snprintf(g_seenLoad.target, sizeof g_seenLoad.target, "%s", event->target);
+		std::snprintf(g_seenLoad.command, sizeof g_seenLoad.command, "%s", event->command);
+		std::snprintf(g_seenLoad.text, sizeof g_seenLoad.text, "%s", event->text ? event->text : "");
 	}
 	return D2RL::SharedEvents::UiMessageAction::Continue;
 }
@@ -193,8 +261,8 @@ static auto __cdecl OnUiMessage(const D2RL::PluginContext*, const D2RL::SharedEv
 static auto __cdecl UiLogCommand(D2R::Game::Client*, const D2RL::ConsoleCommandContext* command, void*) noexcept -> D2RL::ConsoleCommandResult {
 	g_verbose = !g_verbose;
 	char line[256];
-	std::snprintf(line, sizeof line, "quick-new-game: UI log %s. Rejoin sends %s:%s%s%s (%s).", g_verbose ? "on" : "off",
-		g_load.target, g_load.command, *g_load.text ? ":" : "", g_load.text, g_loadLearned ? "your last pick" : "default Hell");
+	std::snprintf(line, sizeof line, "quick-new-game: UI log %s. Rejoin sends %s:%s%s%s (this game's difficulty), then Play if needed.",
+		g_verbose ? "on" : "off", g_load.target, g_load.command, *g_load.text ? ":" : "", g_load.text);
 	command->plugin->WriteConsoleMessage(line);
 	return D2RL::ConsoleCommandResult::Handled;
 }

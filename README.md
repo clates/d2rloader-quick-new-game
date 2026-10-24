@@ -9,8 +9,8 @@ save and exit, then rejoin on the same character at the same difficulty in under
 2. Download `quick-new-game.dll` from [Releases](../../releases).
 3. Put it in `<game folder>/d2rloader/plugins/` and start the game through D2RLoader.
 
-Rebind it under **Options → Controls → Quick New Game**. It rejoins at the difficulty you
-last picked yourself (Hell until you've picked one).
+Rebind it under **Options → Controls → Quick New Game**. It rejoins at the difficulty of the
+game you left, including characters that haven't beaten Normal yet.
 
 For offline single player. Remove the DLL before playing online.
 
@@ -21,11 +21,17 @@ items.
 
 1. `PanelManager:OpenPanel:PauseLayout`, then `PausePanelMessage:ExitGame` on the next
    frame (the pause menu ignores Exit while it's closed).
-2. When the character screen reports it's loaded (`CharacterSelect:SelectAct`), it sends
-   `CharacterSelect:LoadCharacter:<difficulty>`, replaying your last difficulty click.
+2. When the character screen has opened and its loading panel has closed
+   (`OpenPanel CharacterSelectPanel` or `CharacterSelect:SelectTab`, and
+   `ClosePanel MainMenuLoadingPanel`), it sends `CharacterSelect:LoadCharacter:<difficulty>` for
+   the game you left: the difficulty you picked in the popup, or Normal if the game started
+   without one. If that doesn't start the game, it also presses Play (`MainMenuHD:Play`), which
+   starts a Normal-only character directly.
 
-Each step is retried on a short timer until the game's `GameLeft` / `GameJoined` event
-confirms it. Messages sent to a closed panel are ignored, so retries are harmless.
+Each step is retried on a timer until the game moves on: Save and Exit until the game heads to
+the menus, the rejoin until it starts loading (`FrontEndNavigation:ToGame`). Nothing is sent
+while the game is loading, so a slow load never gets a second request. If the character
+screen's ready messages never arrive, the rejoin goes out after 8 seconds.
 
 ## Build
 
