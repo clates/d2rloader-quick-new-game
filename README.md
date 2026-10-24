@@ -25,6 +25,29 @@ current value).
 |---|---|---|
 | `wait_for_loaded_screen` | `false` | `false` rejoins as soon as the character screen appears (about 0.75 s). `true` waits until it has finished loading (about 2 s). Turn it on if the world stays black after a rejoin, which can happen with many mods. |
 
+## Troubleshooting
+
+**The world is black after pressing F9** (the map and HUD still show). On setups with many mods,
+or launched through a mod manager such as D2RMM, the character screen can take longer to finish
+loading. By default Quick New Game rejoins as soon as the screen appears, and a load sent before
+it's done can leave the world black. To fix it, open the D2RLoader console and type:
+
+```
+newgame-wait on
+```
+
+The rejoin then waits until the character screen has finished loading. That takes about 2 s
+instead of 0.75 s. The setting is saved and applies at once; `newgame-wait off` switches back.
+If the world is black right now, Save and Exit by hand and load the character again; a normal load should bring it back.
+
+**It rejoins at the wrong difficulty.** It uses the difficulty of the game you just left. Before
+0.8.0 it used the last difficulty you clicked on any character, and characters that hadn't
+beaten Normal couldn't rejoin. Update to the latest release.
+
+**Nothing happens on F9.** Check the key under Options → Controls → Quick New Game, and look in
+`d2rloader/logs/quick-new-game.log`. Every rejoin logs a "back in game" line; `newgame-ui` in the
+console logs every message for a bug report.
+
 ## How it works
 
 It sends the same UI messages the game's own buttons send. It doesn't write memory or touch
