@@ -19,12 +19,16 @@
 // the same update it's ignored), so the menu shows for about a frame, and stops
 // once the game heads to the menus (FrontEndNavigation:ToFrontEnd).
 //
-// The rejoin waits until the character screen has finished loading: it has
-// opened (OpenPanel CharacterSelectPanel or CharacterSelect:SelectTab) and the
-// loading panel is closed. CharacterSelect:SelectAct comes too early on heavily
-// modded setups, and a load sent then can leave the world black. Resends stop
-// as soon as the game starts loading (FrontEndNavigation:ToGame), so a slow
-// load never gets a second request. All state lives on the UI thread.
+// When the rejoin goes out is a setting (quick-new-game.toml):
+//   wait_for_loaded_screen = false  (default) as soon as the character screen
+//     sends CharacterSelect:SelectAct: about 0.75 s from F9 to back in game.
+//   wait_for_loaded_screen = true   once the screen has opened (OpenPanel
+//     CharacterSelectPanel or CharacterSelect:SelectTab) and its loading panel
+//     has closed: about 2 s. SelectAct can come before loading is done on
+//     heavily modded setups, and a load sent then can leave the world black.
+// Either way resends stop as soon as the game starts loading
+// (FrontEndNavigation:ToGame), so a slow load never gets a second request.
+// All state lives on the UI thread.
 
 #include <D2RLPlugin/api.h>
 
@@ -47,9 +51,12 @@ static constexpr D2RL::PluginInfo Info {
 
 static constexpr ULONGLONG ExitRetryMs  = 250;    // resend Save and Exit until the game heads to the menus
 static constexpr ULONGLONG ExitGiveUpMs = 5000;   // still in game this long after the press: stop
-static constexpr ULONGLONG LoadFirstMs  = 8000;   // fallback if the screen-ready messages never come
-static constexpr ULONGLONG SettleMs     = 250;    // after the screen is ready, in case a loading panel follows
-static constexpr ULONGLONG LoadRetryMs  = 2000;   // resend the rejoin until the game starts loading
+// Fast (default) and wait_for_loaded_screen timings.
+static constexpr ULONGLONG FastFirstMs  = 1500;   // fallback if the screen-ready message never comes
+static constexpr ULONGLONG FastRetryMs  = 500;    // resend the rejoin until the game starts loading
+static constexpr ULONGLONG SafeFirstMs  = 8000;
+static constexpr ULONGLONG SafeRetryMs  = 2000;
+static constexpr ULONGLONG SettleMs     = 250;    // after the loaded screen, in case a loading panel follows
 static constexpr ULONGLONG LoadGiveUpMs = 30000;  // not back in game this long after leaving: stop
 static constexpr int       PlayAfterTries = 2;    // rejoin sends before the Play fallback joins in
 
@@ -71,6 +78,16 @@ static const D2RL::PluginContext* g_ctx;
 static const D2RL::WidgetService* g_widgets;
 static const D2RL::ThreadService* g_threads;
 
+static constexpr char DefaultConfig[] =
+	"# Quick New Game settings. Restart the game after editing this file, or use\n"
+	"# the console command: newgame-wait on|off (applies at once).\n"
+	"\n"
+	"# false: rejoin as soon as the character screen appears (about 0.75 s).\n"
+	"# true: wait until it has finished loading (about 2 s). Turn this on if the\n"
+	"# world stays black after a rejoin, which can happen with many mods.\n"
+	"wait_for_loaded_screen = false\n";
+
+static bool      g_waitForLoaded;   // wait_for_loaded_screen
 static bool      g_inGame;
 static bool      g_verbose;     // newgame-ui: log UI messages and every send
 static Phase     g_phase = Phase::Idle;
@@ -135,14 +152,14 @@ static void __cdecl Tick(const D2RL::PluginContext*, void* userData) noexcept {
 				Send(SaveExit);
 			}
 			g_nextSendAt = now + ExitRetryMs;
-		} else if (g_screenLoading) {
+		} else if (g_waitForLoaded && g_screenLoading) {
 			g_nextSendAt = now + SettleMs;   // never load while the menu is still loading
 		} else {
 			// Alternate LoadCharacter with Play once LoadCharacter alone hasn't worked.
 			const bool play = g_loadSends >= PlayAfterTries && (g_loadSends - PlayAfterTries) % 2 == 0;
 			Send(play ? Play : g_load);
 			++g_loadSends;
-			g_nextSendAt = now + LoadRetryMs;
+			g_nextSendAt = now + (g_waitForLoaded ? SafeRetryMs : FastRetryMs);
 		}
 	}
 	g_threads->runOnUiThread(g_ctx, Tick, userData);
@@ -181,7 +198,7 @@ static void __cdecl OnGameplay(const D2RL::PluginContext*, const D2RL::Lifecycle
 		if (g_phase == Phase::Exiting) {
 			g_phase      = Phase::Rejoining;
 			g_leftAt     = now;
-			g_nextSendAt = now + LoadFirstMs;
+			g_nextSendAt = now + (g_waitForLoaded ? SafeFirstMs : FastFirstMs);
 		}
 	} else if (event->kind == D2RL::Lifecycle::GameplayEventKind::GameJoined) {
 		g_inGame = true;
@@ -236,11 +253,17 @@ static auto __cdecl OnUiMessage(const D2RL::PluginContext*, const D2RL::SharedEv
 			g_screenOpen = true;
 		}
 	}
-	// The character screen is open and done loading: rejoin shortly instead of
-	// waiting for the timer. Tick checks the loading panel again before sending.
-	if (g_phase == Phase::Rejoining && g_readyAt == 0 && g_screenOpen && !g_screenLoading) {
-		g_readyAt    = GetTickCount64();
-		g_nextSendAt = g_readyAt + SettleMs;
+	// The character screen is ready: rejoin now instead of waiting for the timer.
+	// Fast: its list is loaded (SelectAct), send on the next update. Waiting: it
+	// has opened and finished loading; Tick checks the loading panel again.
+	if (g_phase == Phase::Rejoining && g_readyAt == 0) {
+		if (!g_waitForLoaded && is("CharacterSelect", "SelectAct")) {
+			g_readyAt    = GetTickCount64();
+			g_nextSendAt = 0;
+		} else if (g_waitForLoaded && g_screenOpen && !g_screenLoading) {
+			g_readyAt    = GetTickCount64();
+			g_nextSendAt = g_readyAt + SettleMs;
+		}
 	}
 	// The game took a rejoin request and is loading: stop sending.
 	if (g_phase == Phase::Rejoining && is("FrontEndNavigation", "ToGame")) {
@@ -261,8 +284,8 @@ static auto __cdecl OnUiMessage(const D2RL::PluginContext*, const D2RL::SharedEv
 static auto __cdecl UiLogCommand(D2R::Game::Client*, const D2RL::ConsoleCommandContext* command, void*) noexcept -> D2RL::ConsoleCommandResult {
 	g_verbose = !g_verbose;
 	char line[256];
-	std::snprintf(line, sizeof line, "quick-new-game: UI log %s. Rejoin sends %s:%s%s%s (this game's difficulty), then Play if needed.",
-		g_verbose ? "on" : "off", g_load.target, g_load.command, *g_load.text ? ":" : "", g_load.text);
+	std::snprintf(line, sizeof line, "quick-new-game: UI log %s. Rejoin sends %s:%s%s%s (this game's difficulty), then Play if needed; wait_for_loaded_screen = %s.",
+		g_verbose ? "on" : "off", g_load.target, g_load.command, *g_load.text ? ":" : "", g_load.text, g_waitForLoaded ? "true" : "false");
 	command->plugin->WriteConsoleMessage(line);
 	return D2RL::ConsoleCommandResult::Handled;
 }
@@ -288,6 +311,80 @@ static auto __cdecl SendCommand(D2R::Game::Client*, const D2RL::ConsoleCommandCo
 	return D2RL::ConsoleCommandResult::Handled;
 }
 
+static void LoadSettings() noexcept {
+	(void)g_ctx->EnsureConfig(DefaultConfig);
+	char text[2048] = {};
+	if (!g_ctx->ReadConfig(text, sizeof text)) {
+		return;
+	}
+	char* next = nullptr;
+	for (char* line = strtok_s(text, "\r\n", &next); line != nullptr; line = strtok_s(nullptr, "\r\n", &next)) {
+		while (*line == ' ' || *line == '\t') {
+			++line;
+		}
+		if (*line == '#' || std::strncmp(line, "wait_for_loaded_screen", 22) != 0) {
+			continue;
+		}
+		const char* value = std::strchr(line, '=');
+		if (value == nullptr) {
+			continue;
+		}
+		do {
+			++value;
+		} while (*value == ' ' || *value == '\t');
+		g_waitForLoaded = std::strncmp(value, "true", 4) == 0;
+	}
+	char note[96];
+	std::snprintf(note, sizeof note, "quick-new-game: wait_for_loaded_screen = %s.", g_waitForLoaded ? "true" : "false");
+	g_ctx->LogInfo(note);
+}
+
+// Rewrite (or add back) the wait_for_loaded_screen line, keeping the rest of the file.
+static auto SaveWaitSetting(bool wait) noexcept -> bool {
+	char text[2048] = {};
+	if (!g_ctx->ReadConfig(text, sizeof text)) {
+		return false;
+	}
+	const char* value = wait ? "true" : "false";
+	char out[2200];
+	char* line = std::strncmp(text, "wait_for_loaded_screen", 22) == 0 ? text : std::strstr(text, "\nwait_for_loaded_screen");
+	if (line == nullptr) {
+		const size_t n = std::strlen(text);
+		std::snprintf(out, sizeof out, "%s%swait_for_loaded_screen = %s\n", text, n && text[n - 1] != '\n' ? "\n" : "", value);
+		return g_ctx->WriteConfig(out);
+	}
+	line += *line == '\n';
+	const char* rest = std::strchr(line, '\n');
+	std::snprintf(out, sizeof out, "%.*swait_for_loaded_screen = %s%s", static_cast<int>(line - text), text, value, rest ? rest : "\n");
+	return g_ctx->WriteConfig(out);
+}
+
+// newgame-wait [on|off]  - show or change wait_for_loaded_screen; saved and applied at once.
+static auto WaitCommand(D2R::Game::Client*, const D2RL::ConsoleCommandContext* command, void*) noexcept -> D2RL::ConsoleCommandResult {
+	const char* arg = command->args ? command->args : "";
+	while (*arg == ' ') {
+		++arg;
+	}
+	char line[200];
+	if (*arg != 0) {
+		const bool on  = std::strncmp(arg, "on", 2) == 0 || std::strncmp(arg, "true", 4) == 0;
+		const bool off = std::strncmp(arg, "off", 3) == 0 || std::strncmp(arg, "false", 5) == 0;
+		if (!on && !off) {
+			command->plugin->WriteConsoleMessage("usage: newgame-wait [on|off]");
+			return D2RL::ConsoleCommandResult::Failed;
+		}
+		g_waitForLoaded = on;
+		if (!SaveWaitSetting(on)) {
+			command->plugin->WriteConsoleMessage("quick-new-game: changed for this session, but couldn't save quick-new-game.toml.");
+			return D2RL::ConsoleCommandResult::Handled;
+		}
+	}
+	std::snprintf(line, sizeof line, "quick-new-game: wait_for_loaded_screen = %s (%s).", g_waitForLoaded ? "on" : "off",
+		g_waitForLoaded ? "rejoin waits for the character screen to finish loading, about 2 s" : "rejoin as soon as the character screen appears, about 0.75 s");
+	command->plugin->WriteConsoleMessage(line);
+	return D2RL::ConsoleCommandResult::Handled;
+}
+
 template <typename Service>
 static bool Query(const D2RL::PluginContext* context, const Service** service) noexcept {
 	return context->QueryService(service) == D2RL::ServiceQueryResult::Success && *service != nullptr;
@@ -302,6 +399,7 @@ D2RL_PLUGIN_EXPORT auto D2RLoaderLoadPlugin(const D2RL::PluginContext* context) 
 		return false;
 	}
 	g_ctx = context;
+	LoadSettings();
 
 	const D2RL::InputService*       input     = nullptr;
 	const D2RL::LifecycleService*   lifecycle = nullptr;
@@ -351,7 +449,8 @@ D2RL_PLUGIN_EXPORT auto D2RLoaderLoadPlugin(const D2RL::PluginContext* context) 
 	}
 
 	return context->RegisterConsoleCommand("newgame-ui", UiLogCommand, "Toggle the UI message log and show what the rejoin sends.")
-		&& context->RegisterConsoleCommand("newgame-send", SendCommand, "Send a UI message: newgame-send Target:Command[:Text]");
+		&& context->RegisterConsoleCommand("newgame-send", SendCommand, "Send a UI message: newgame-send Target:Command[:Text]")
+		&& context->RegisterConsoleCommand("newgame-wait", WaitCommand, "Wait for the character screen to finish loading before rejoining: newgame-wait [on|off]");
 }
 
 D2RL_PLUGIN_EXPORT void D2RLoaderUnloadPlugin() noexcept {}
